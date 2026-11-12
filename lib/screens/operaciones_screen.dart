@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 
 import '../services/api_service.dart';
@@ -118,6 +120,7 @@ class _OperacionesScreenState extends State<OperacionesScreen> {
                   types: _types,
                   clients: _clients,
                   trips: _trips,
+                  units: _units,
                   onSaved: () => _showSaved('Carga registrada correctamente.'),
                 ),
                 _RegisterMovementForm(
@@ -142,6 +145,7 @@ class _RegisterLoadForm extends StatefulWidget {
     required this.types,
     required this.clients,
     required this.trips,
+    required this.units,
     required this.onSaved,
   });
 
@@ -149,6 +153,7 @@ class _RegisterLoadForm extends StatefulWidget {
   final List<Map<String, dynamic>> types;
   final List<Map<String, dynamic>> clients;
   final List<Map<String, dynamic>> trips;
+  final List<Map<String, dynamic>> units;
   final VoidCallback onSaved;
 
   @override
@@ -168,6 +173,112 @@ class _RegisterLoadFormState extends State<_RegisterLoadForm> {
   bool _saving = false;
   String? _error;
 
+  Map<String, dynamic>? get _selectedTrip => widget.trips
+      .where((trip) => readInt(trip['id_viaje']) == _tripId)
+      .firstOrNull;
+
+  Map<String, dynamic>? get _selectedType => widget.types
+      .where((type) => readInt(type['id_tipo_carga']) == _typeId)
+      .firstOrNull;
+
+  Map<String, dynamic>? get _selectedUnit {
+    final unitId = _selectedTrip?['id_unidad'];
+    return widget.units
+        .where((unit) => unit['id_unidad']?.toString() == unitId?.toString())
+        .firstOrNull;
+  }
+
+  String? _tripLoadValidationError() {
+    final trip = _selectedTrip;
+    if (trip == null) return null;
+
+    final type = _selectedType;
+    final unit = _selectedUnit;
+    if (type == null || unit == null) {
+      return 'No se pudieron verificar el tipo de carga y la unidad del viaje.';
+    }
+
+    final loadTypeName = _normalizeCompatibilityName(
+      type['nombre']?.toString() ?? '',
+    );
+    final unitTypeName = _normalizeCompatibilityName(
+      unit['tipo_nombre']?.toString() ?? '',
+    );
+    final isLiquidCargo =
+        loadTypeName.contains('liquid') || loadTypeName.contains('combustible');
+    final isTankTruck = unitTypeName.contains('cisterna');
+    if (isLiquidCargo && !isTankTruck) {
+      return 'Las cargas líquidas solo se pueden transportar en una cisterna.';
+    }
+    if (isTankTruck && !isLiquidCargo) {
+      return 'Las cisternas solo se pueden asignar a cargas líquidas.';
+    }
+
+    final compatibleTypes = _parseCompatibleUnitTypes(
+      type['unidades_compatibles']?.toString(),
+    );
+    final unitTypeId = unit['id_tipo_unidad']?.toString().trim();
+    if (compatibleTypes.isNotEmpty &&
+        (unitTypeId == null || !compatibleTypes.contains(unitTypeId))) {
+      return 'Este tipo de carga no es compatible con la unidad '
+          '${unit['placa'] ?? 'seleccionada'} (${unit['tipo_nombre'] ?? 'tipo sin indicar'}).';
+    }
+
+    final loadClientId = _clientId?.toString();
+    final tripClientId = trip['id_cliente']?.toString();
+    if (loadClientId != null &&
+        tripClientId != null &&
+        loadClientId != tripClientId) {
+      return 'El cliente de la carga debe coincidir con el cliente del viaje.';
+    }
+
+    final rawWeight = _weight.text.trim();
+    final weight = double.tryParse(rawWeight);
+    final capacity = readDouble(unit['capacidad_ton']);
+    if (rawWeight.isNotEmpty &&
+        weight != null &&
+        capacity != null &&
+        weight > capacity) {
+      return 'El peso de la carga supera la capacidad de la unidad '
+          '(${capacity.toStringAsFixed(2)} t).';
+    }
+    return null;
+  }
+
+  String _normalizeCompatibilityName(String value) => value
+      .toLowerCase()
+      .replaceAll('á', 'a')
+      .replaceAll('é', 'e')
+      .replaceAll('í', 'i')
+      .replaceAll('ó', 'o')
+      .replaceAll('ú', 'u');
+
+  Set<String> _parseCompatibleUnitTypes(String? value) {
+    final raw = (value ?? '').trim();
+    if (raw.isEmpty) return {};
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is List) {
+        return decoded
+            .map((item) => item.toString().trim())
+            .where((item) => item.isNotEmpty)
+            .toSet();
+      }
+    } on FormatException {
+      // Compatibility values may also be stored as comma/semicolon-separated IDs.
+    }
+    return raw
+        .replaceAll('[', '')
+        .replaceAll(']', '')
+        .replaceAll('"', '')
+        .replaceAll("'", '')
+        .replaceAll(';', ',')
+        .split(',')
+        .map((item) => item.trim())
+        .where((item) => item.isNotEmpty)
+        .toSet();
+  }
+
   @override
   void dispose() {
     _description.dispose();
@@ -180,6 +291,11 @@ class _RegisterLoadFormState extends State<_RegisterLoadForm> {
 
   Future<void> _save() async {
     if (!_formKey.currentState!.validate()) return;
+    final tripValidationError = _tripLoadValidationError();
+    if (tripValidationError != null) {
+      setState(() => _error = tripValidationError);
+      return;
+    }
     setState(() {
       _saving = true;
       _error = null;
@@ -265,7 +381,10 @@ class _RegisterLoadFormState extends State<_RegisterLoadForm> {
                         ),
                       )
                       .toList(),
-                  onChanged: (value) => setState(() => _typeId = value),
+                  onChanged: (value) => setState(() {
+                    _typeId = value;
+                    _error = null;
+                  }),
                   validator: (value) =>
                       value == null ? 'Selecciona el tipo de carga.' : null,
                 ),
@@ -281,7 +400,9 @@ class _RegisterLoadFormState extends State<_RegisterLoadForm> {
                         ),
                         validator: (value) {
                           final quantity = int.tryParse(value?.trim() ?? '');
-                          return quantity == null || quantity <= 0
+                          return quantity == null ||
+                                  quantity <= 0 ||
+                                  quantity > 2147483647
                               ? 'Ingresa una cantidad positiva.'
                               : null;
                         },
@@ -314,8 +435,15 @@ class _RegisterLoadFormState extends State<_RegisterLoadForm> {
                   ),
                   validator: (value) {
                     if (value == null || value.trim().isEmpty) return null;
-                    final weight = double.tryParse(value.trim());
-                    return weight == null || !weight.isFinite || weight < 0
+                    final input = value.trim();
+                    if (!RegExp(r'^\d+(\.\d{1,2})?$').hasMatch(input)) {
+                      return 'Usa un peso válido con máximo dos decimales.';
+                    }
+                    final weight = double.tryParse(input);
+                    return weight == null ||
+                            !weight.isFinite ||
+                            weight <= 0 ||
+                            weight > 99999999.99
                         ? 'Ingresa un peso válido.'
                         : null;
                   },
@@ -339,7 +467,10 @@ class _RegisterLoadFormState extends State<_RegisterLoadForm> {
                       ),
                     ),
                   ],
-                  onChanged: (value) => setState(() => _clientId = value),
+                  onChanged: (value) => setState(() {
+                    _clientId = value;
+                    _error = null;
+                  }),
                 ),
                 const SizedBox(height: 10),
                 DropdownButtonFormField<int?>(
@@ -364,8 +495,22 @@ class _RegisterLoadFormState extends State<_RegisterLoadForm> {
                           ),
                         ),
                   ],
-                  onChanged: (value) => setState(() => _tripId = value),
+                  onChanged: (value) => setState(() {
+                    _tripId = value;
+                    _error = null;
+                  }),
                 ),
+                if (_tripId != null &&
+                    _typeId != null &&
+                    _tripLoadValidationError() != null) ...[
+                  const SizedBox(height: 8),
+                  Text(
+                    _tripLoadValidationError()!,
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.error,
+                    ),
+                  ),
+                ],
                 const SizedBox(height: 10),
                 TextFormField(
                   controller: _document,

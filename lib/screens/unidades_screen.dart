@@ -1,7 +1,11 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../services/api_service.dart';
 import 'common_widgets.dart';
+
+const double _estimatedKmPerGallon = 8;
 
 class UnidadesScreen extends StatefulWidget {
   const UnidadesScreen({
@@ -27,11 +31,23 @@ class _UnidadesScreenState extends State<UnidadesScreen> {
   List<Map<String, dynamic>> _states = [];
   List<Map<String, dynamic>> _drivers = [];
   List<Map<String, dynamic>> _trips = [];
+  late final Timer _refreshTimer;
+  bool _refreshingFuelEstimates = false;
 
   @override
   void initState() {
     super.initState();
     _load();
+    _refreshTimer = Timer.periodic(
+      const Duration(seconds: 30),
+      (_) => unawaited(_refreshFuelEstimates()),
+    );
+  }
+
+  @override
+  void dispose() {
+    _refreshTimer.cancel();
+    super.dispose();
   }
 
   Future<void> _load() async {
@@ -63,6 +79,28 @@ class _UnidadesScreenState extends State<UnidadesScreen> {
           _loading = false;
         });
       }
+    }
+  }
+
+  Future<void> _refreshFuelEstimates() async {
+    if (!mounted || _loading || _refreshingFuelEstimates) return;
+    _refreshingFuelEstimates = true;
+    try {
+      final values = await Future.wait<List<Map<String, dynamic>>>([
+        widget.api.getList('unidades/unidades/'),
+        widget.api.getList('viajes/viajes/'),
+      ]);
+      if (mounted) {
+        setState(() {
+          _units = values[0];
+          _trips = values[1];
+          _error = null;
+        });
+      }
+    } on ApiException catch (error) {
+      if (mounted) setState(() => _error = error.message);
+    } finally {
+      _refreshingFuelEstimates = false;
     }
   }
 
@@ -257,6 +295,13 @@ class _UnidadesScreenState extends State<UnidadesScreen> {
               ..._units.map(
                 (unit) => _UnitCard(
                   unit: unit,
+                  trips: _trips
+                      .where(
+                        (trip) =>
+                            trip['id_unidad']?.toString() ==
+                            unit['id_unidad']?.toString(),
+                      )
+                      .toList(),
                   isAdmin: widget.isAdmin,
                   onEdit: widget.isAdmin ? () => _edit(unit) : null,
                   onDelete: widget.isAdmin ? () => _delete(unit) : null,
@@ -273,9 +318,43 @@ class _UnidadesScreenState extends State<UnidadesScreen> {
   }
 }
 
+double _estimatedFuelUsed(
+  Map<String, dynamic> unit,
+  List<Map<String, dynamic>> trips,
+) {
+  final recordedFuel = readDouble(unit['combustible_actual_gal']);
+  final lastReading = DateTime.tryParse(
+    unit['fecha_combustible_actual']?.toString() ?? '',
+  );
+  var used = 0.0;
+  for (final trip in trips) {
+    final status = readInt(trip['id_estado_viaje']);
+    if (!readBool(trip['es_simulado']) || (status != 2 && status != 3)) {
+      continue;
+    }
+
+    final startedAt = DateTime.tryParse(
+      (trip['fecha_salida'] ?? trip['fecha_programada'])?.toString() ?? '',
+    );
+    if (startedAt == null ||
+        (lastReading != null && startedAt.isBefore(lastReading))) {
+      continue;
+    }
+
+    final distanceKm = readDouble(trip['distancia_km']);
+    if (distanceKm == null || distanceKm <= 0) continue;
+    final progress = status == 3
+        ? 1.0
+        : (readDouble(trip['progreso_simulado']) ?? 0).clamp(0.0, 1.0);
+    used += distanceKm * progress / _estimatedKmPerGallon;
+  }
+  return recordedFuel == null ? used : used.clamp(0.0, recordedFuel).toDouble();
+}
+
 class _UnitCard extends StatelessWidget {
   const _UnitCard({
     required this.unit,
+    required this.trips,
     required this.isAdmin,
     required this.onEdit,
     required this.onDelete,
@@ -283,6 +362,7 @@ class _UnitCard extends StatelessWidget {
   });
 
   final Map<String, dynamic> unit;
+  final List<Map<String, dynamic>> trips;
   final bool isAdmin;
   final VoidCallback? onEdit;
   final VoidCallback? onDelete;
@@ -293,8 +373,12 @@ class _UnitCard extends StatelessWidget {
     final active = readBool(unit['activo'], fallback: true);
     final fuel = readDouble(unit['combustible_actual_gal']);
     final capacity = readDouble(unit['capacidad_tanque_gal']);
-    final fuelRatio = fuel != null && capacity != null && capacity > 0
-        ? (fuel / capacity).clamp(0, 1).toDouble()
+    final estimatedFuelUsed = _estimatedFuelUsed(unit, trips);
+    final displayedFuel = fuel == null
+        ? null
+        : (fuel - estimatedFuelUsed).clamp(0.0, fuel).toDouble();
+    final fuelRatio = displayedFuel != null && capacity != null && capacity > 0
+        ? (displayedFuel / capacity).clamp(0, 1).toDouble()
         : null;
     return Card(
       margin: const EdgeInsets.only(bottom: 10),
@@ -376,11 +460,19 @@ class _UnitCard extends StatelessWidget {
                   ),
                   const SizedBox(width: 10),
                   Text(
-                    fuel == null
+                    displayedFuel == null
                         ? 'Sin lectura'
-                        : '${fuel.toStringAsFixed(1)} gal',
+                        : '${displayedFuel.toStringAsFixed(1)} gal',
                   ),
                 ],
+              ),
+            ],
+            if (estimatedFuelUsed > 0) ...[
+              const SizedBox(height: 5),
+              Text(
+                'Trayecto: ${estimatedFuelUsed.toStringAsFixed(1)} gal menos '
+                '(estimado a $_estimatedKmPerGallon km/gal).',
+                style: TextStyle(color: Colors.blueGrey.shade600, fontSize: 11),
               ),
             ],
           ],
